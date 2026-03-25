@@ -1529,6 +1529,15 @@ def eval_val_sliding_ttt(
                                                    p_current)
                             scored_nll = -torch.log(p_blended.clamp(min=1e-12)).to(torch.float64)
 
+                    # Confidence sharpening: if blended probability is high, sharpen further
+                    sharpen_gamma = float(os.environ.get("SHARPEN_GAMMA", "0"))
+                    if sharpen_gamma > 0:
+                        p_final = torch.exp(-scored_nll)
+                        # Only sharpen confident predictions (p > 0.5)
+                        # NLL reduction: multiply confident p by (1 + gamma * (p - 0.5))
+                        boost = (1.0 + sharpen_gamma * (p_final - 0.5).clamp(min=0)).clamp(max=2.0)
+                        scored_nll = -torch.log((p_final * boost).clamp(min=1e-12, max=1.0))
+
                     loss_sum += scored_nll.sum()
                     token_count += float(seg_len)
                     tgt, prev = y_batch[i, s:wlen], x_batch[i, s:wlen]
@@ -1574,7 +1583,21 @@ def eval_val_sliding_ttt(
 
         # --- Phase 2: TRAIN on this chunk (already scored = legal) ---
         is_last_chunk = (ci == num_chunks - 1)
-        if not is_last_chunk and ttt_epochs > 0:
+        # Adaptive TTT: adjust epochs based on chunk difficulty
+        use_adaptive_ttt = os.environ.get("ADAPTIVE_TTT_EPOCHS", "0") == "1"
+        if use_adaptive_ttt and token_count.item() > 0:
+            chunk_bpb = (loss_sum.item() / max(token_count.item(), 1)) / math.log(2.0) * \
+                        (token_count.item() / max(byte_count.item(), 1))
+            # Easy chunks (low BPB) = fewer epochs, hard chunks = more epochs
+            if chunk_bpb < 0.7:
+                effective_epochs = max(1, ttt_epochs - 2)  # easy: skip epochs
+            elif chunk_bpb > 1.2:
+                effective_epochs = min(ttt_epochs + 2, 8)  # hard: extra epochs
+            else:
+                effective_epochs = ttt_epochs  # normal
+        else:
+            effective_epochs = ttt_epochs
+        if not is_last_chunk and effective_epochs > 0:
             chunk_start = ci * ttt_chunk_tokens
             chunk_end = min((ci + 1) * ttt_chunk_tokens, total_tokens)
             chunk_seqs = (chunk_end - chunk_start) // seq_len
@@ -1593,9 +1616,9 @@ def eval_val_sliding_ttt(
                 my_seq_s = (chunk_seqs * rank) // world_size
                 my_seq_e = (chunk_seqs * (rank + 1)) // world_size
                 my_chunk_seqs = my_seq_e - my_seq_s
-                for _ep in range(ttt_epochs):
+                for _ep in range(effective_epochs):
                     if rank == 0 and ci < 3:
-                        print(f"    ttt_train [{ci+1}] epoch={_ep+1}/{ttt_epochs} batches={my_chunk_seqs} ...", flush=True)
+                        print(f"    ttt_train [{ci+1}] epoch={_ep+1}/{effective_epochs} batches={my_chunk_seqs} ...", flush=True)
                     for bs in range(0, my_chunk_seqs, batch_seqs):
                         be = min(bs + batch_seqs, my_chunk_seqs)
                         actual_bs = my_seq_s + bs
