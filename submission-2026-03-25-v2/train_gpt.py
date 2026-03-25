@@ -336,6 +336,7 @@ class NgramEvalCache:
         self.geometric = geometric
         self.count_weighted = count_weighted
         self.blend_orders = blend_orders
+        self.use_negative = bool(int(os.environ.get("NGRAM_USE_NEGATIVE", "0")))
         self.mask = np.uint64(buckets - 1)
         self.ctx_tables: dict[int, np.ndarray] = {}
         self.full_tables: dict[int, np.ndarray] = {}
@@ -398,17 +399,18 @@ class NgramEvalCache:
             best_p = np.zeros(seg_len, dtype=np.float64)
             blend_mask = weight_sum > 0
             best_p[blend_mask] = weighted_p[blend_mask] / weight_sum[blend_mask]
-            return best_p, has_match, total_counts
+            return best_p, has_match, total_counts, np.zeros(seg_len, dtype=bool)
 
         # Standard backoff: use highest matching order
         best_p = np.zeros(seg_len, dtype=np.float64)
         has_match = np.zeros(seg_len, dtype=bool)
+        has_negative = np.zeros(seg_len, dtype=bool)  # context seen but target never
         match_counts = np.zeros(seg_len, dtype=np.float64)
         orders = range(self.max_order, 1, -1) if self.backoff else [self.max_order]
 
         for n in orders:
             ctx_w = n - 1
-            eligible = (target_pos >= ctx_w) & ~has_match
+            eligible = (target_pos >= ctx_w) & ~has_match & ~has_negative
             if not eligible.any():
                 continue
             idx = np.where(eligible)[0]
@@ -428,12 +430,23 @@ class NgramEvalCache:
             full_hash = ctx_hash[sufficient] ^ (tgt[sufficient] * self.PRIMES[ctx_w % n_primes])
             full_key = (full_hash & self.mask).astype(np.intp)
             s_full = self.full_tables[n][full_key].astype(np.float64)
-            p_ng = np.minimum(s_full, s_ctx) / np.maximum(s_ctx, 1.0)
-            best_p[s_idx] = np.clip(p_ng, 0.0, 1.0)
-            match_counts[s_idx] = s_ctx
-            has_match[s_idx] = True
+            # Positive evidence: target seen in this context
+            has_target = s_full > 0
+            if has_target.any():
+                pos_idx = s_idx[has_target]
+                pos_ctx = s_ctx[has_target]
+                pos_full = s_full[has_target]
+                p_ng = np.minimum(pos_full, pos_ctx) / np.maximum(pos_ctx, 1.0)
+                best_p[pos_idx] = np.clip(p_ng, 0.0, 1.0)
+                match_counts[pos_idx] = pos_ctx
+                has_match[pos_idx] = True
+            # Negative evidence: context seen >= 5 times but target NEVER appeared
+            neg_mask = (~has_target) & (s_ctx >= 5)
+            if neg_mask.any() and self.use_negative:
+                neg_idx = s_idx[neg_mask]
+                has_negative[neg_idx] = True
 
-        return best_p, has_match, match_counts
+        return best_p, has_match, match_counts, has_negative
 
     def get_alpha(self, entropy):
         """Per-token blending alpha from model entropy (nats)."""
@@ -1488,7 +1501,11 @@ def eval_val_sliding_ttt(
                         ent = _entropy_batch[i, s:wlen].cpu().numpy().astype(np.float64)
                         tgt_pos = np.arange(ws + s + 1, ws + wlen + 1)
                         tgt_toks = val_np[tgt_pos]
-                        p_ng, has_match, match_counts = ngram_cache.lookup(val_np, tgt_pos, tgt_toks)
+                        p_ng, has_match, match_counts, has_negative = ngram_cache.lookup(val_np, tgt_pos, tgt_toks)
+                        # Negative evidence: penalize model for tokens the n-gram has never seen in this context
+                        neg_penalty = float(os.environ.get("NGRAM_NEG_PENALTY", "0.5"))
+                        if has_negative.any() and neg_penalty < 1.0:
+                            p_model[has_negative] *= neg_penalty
                         if has_match.any():
                             alpha = ngram_cache.get_alpha(ent)
                             # Count-weighted: scale alpha by confidence in the n-gram estimate
