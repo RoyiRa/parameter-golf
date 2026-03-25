@@ -203,6 +203,68 @@ class LogisticContextMixer:
             self.log_weights -= self.eta * expert_mean_loss
 
 
+class LSHSemanticCache:
+    """Locality-sensitive hashing cache for semantic n-gram prediction.
+
+    Hashes 512-dim hidden states into buckets using random projections,
+    then stores (bucket → next-token counts). Captures semantic repetition
+    that token-level n-grams miss — similar contexts with different surface
+    tokens map to the same bucket.
+    Score-first legal: cache updated only after scoring.
+    """
+
+    def __init__(self, hidden_dim: int = 512, n_bits: int = 14, vocab_size: int = 1024,
+                 device: str = 'cuda', lsh_lambda: float = 0.10):
+        self.n_bits = n_bits
+        self.n_buckets = 1 << n_bits  # 16384 buckets for 14 bits
+        self.V = vocab_size
+        self.device = device
+        self.lsh_lambda = lsh_lambda  # blending weight
+        # Random projection matrix for LSH (fixed seed for reproducibility)
+        rng = np.random.RandomState(42)
+        self.proj = torch.from_numpy(
+            rng.randn(hidden_dim, n_bits).astype(np.float32)
+        ).to(device)
+        # Count table: [n_buckets, vocab_size]
+        self.counts = torch.zeros(self.n_buckets, vocab_size, device=device)
+        self.bucket_totals = torch.zeros(self.n_buckets, device=device)
+        self.total_tokens = 0
+
+    def _hash(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Hash hidden states to bucket indices. hidden: [..., hidden_dim] -> [...] int64"""
+        bits = (hidden.float() @ self.proj > 0).long()  # [..., n_bits]
+        powers = (1 << torch.arange(self.n_bits, device=self.device)).long()
+        return (bits * powers).sum(-1)  # [...] bucket indices
+
+    def get_probs(self, hidden: torch.Tensor, targets: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Get semantic cache probability for target tokens.
+
+        Args:
+            hidden: [N, hidden_dim] hidden states
+            targets: [N] target token indices
+
+        Returns:
+            (p_semantic, has_data): both [N]
+        """
+        bucket_idx = self._hash(hidden)  # [N]
+        totals = self.bucket_totals[bucket_idx]  # [N]
+        has_data = totals >= 5  # need minimum evidence
+        target_counts = self.counts[bucket_idx, targets]  # [N]
+        # Laplace-smoothed probability
+        p = (target_counts + 0.01) / (totals + 0.01 * self.V)
+        return p, has_data
+
+    def update(self, hidden: torch.Tensor, targets: torch.Tensor):
+        """Add scored tokens to the cache."""
+        with torch.no_grad():
+            bucket_idx = self._hash(hidden)  # [N]
+            flat_idx = bucket_idx * self.V + targets.long()
+            ones = torch.ones(len(targets), device=self.device)
+            self.counts.reshape(-1).scatter_add_(0, flat_idx, ones)
+            self.bucket_totals.scatter_add_(0, bucket_idx, ones)
+            self.total_tokens += len(targets)
+
+
 class OnlineLogitCalibrator:
     """Online calibration of model logits using scored token statistics.
 
@@ -1090,6 +1152,34 @@ class GPT(nn.Module):
             logits_proj = self.lm_head(x)
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
+    def forward_hidden_and_logits(self, input_ids: Tensor) -> tuple[Tensor, Tensor]:
+        """Return both pre-projection hidden states and logits."""
+        x = self.tok_emb(input_ids)
+        if self.bigram is not None:
+            x = x + self.bigram(input_ids)
+        x = F.rms_norm(x, (x.size(-1),))
+        x = self.smear(x)
+        x0 = x
+        skips: list[Tensor] = []
+        ve_cache: dict = {}
+        for i in range(self.num_encoder_layers):
+            ve = self._get_ve(i, input_ids, ve_cache)
+            x = self.blocks[i](x, x0, v_embed=ve)
+            skips.append(x)
+        for i in range(self.num_decoder_layers):
+            bi = self.num_encoder_layers + i
+            if skips:
+                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            ve = self._get_ve(bi, input_ids, ve_cache)
+            x = self.blocks[bi](x, x0, v_embed=ve)
+        x = self.final_norm(x)
+        if self.tie_embeddings:
+            logits_proj = F.linear(x, self.tok_emb.weight)
+        else:
+            logits_proj = self.lm_head(x)
+        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        return x, logits
+
 def eval_val_sliding(args: Hyperparameters, base_model: nn.Module, rank: int, world_size: int,
                      device: torch.device, val_tokens: Tensor, base_bytes_lut: Tensor,
                      has_leading_space_lut: Tensor, is_boundary_token_lut: Tensor,
@@ -1226,6 +1316,15 @@ def eval_val_sliding_ttt(
     if use_logit_cal and rank == 0:
         print(f"  Online logit calibration enabled: momentum={logit_cal.momentum}")
 
+    # LSH semantic cache
+    use_lsh = os.environ.get("USE_LSH_CACHE", "0") == "1"
+    lsh_cache = LSHSemanticCache(
+        hidden_dim=args.model_dim, n_bits=14, vocab_size=args.vocab_size,
+        device=device, lsh_lambda=float(os.environ.get("LSH_LAMBDA", "0.10")),
+    ) if use_lsh else None
+    if use_lsh and rank == 0:
+        print(f"  LSH semantic cache: bits={lsh_cache.n_bits} buckets={lsh_cache.n_buckets} lambda={lsh_cache.lsh_lambda}")
+
     # Pre-compute all window starts
     window_starts = [ws for ws in range(0, total_tokens, stride)
                      if min(ws + seq_len, total_tokens) - ws >= stride or ws == 0]
@@ -1334,7 +1433,11 @@ def eval_val_sliding_ttt(
                     x_batch[i, :wlen] = chunk_tok[:-1]
                     y_batch[i, :wlen] = chunk_tok[1:]
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    logits = base_model.forward_logits(x_batch)
+                    if lsh_cache is not None:
+                        hidden_states, logits = base_model.forward_hidden_and_logits(x_batch)
+                    else:
+                        logits = base_model.forward_logits(x_batch)
+                        hidden_states = None
                 logits_scaled = logits.float() / ttt_temp
 
                 # Adaptive temperature: sharpen confident predictions more
@@ -1413,6 +1516,19 @@ def eval_val_sliding_ttt(
                     else:
                         scored_nll = nll[i, s:wlen].to(torch.float64)
 
+                    # LSH semantic cache blending (on top of n-gram blending)
+                    if lsh_cache is not None and hidden_states is not None and seg_len > 0 and lsh_cache.total_tokens > 5000:
+                        seg_hidden = hidden_states[i, s:wlen]  # [seg_len, hidden_dim]
+                        seg_targets = y_batch[i, s:wlen]
+                        p_lsh, lsh_has_data = lsh_cache.get_probs(seg_hidden, seg_targets)
+                        if lsh_has_data.any():
+                            p_current = torch.exp(-scored_nll).to(device)
+                            lam = lsh_cache.lsh_lambda
+                            p_blended = torch.where(lsh_has_data,
+                                                   (1 - lam) * p_current + lam * p_lsh,
+                                                   p_current)
+                            scored_nll = -torch.log(p_blended.clamp(min=1e-12)).to(torch.float64)
+
                     loss_sum += scored_nll.sum()
                     token_count += float(seg_len)
                     tgt, prev = y_batch[i, s:wlen], x_batch[i, s:wlen]
@@ -1427,6 +1543,14 @@ def eval_val_sliding_ttt(
                         s = 0 if ws == 0 else max(wlen - stride, 0)
                         if wlen - s > 0:
                             ngram_cache.update(val_np, ws + s + 1, ws + wlen)
+
+                # Update LSH semantic cache with scored tokens AFTER scoring (legal)
+                if lsh_cache is not None and hidden_states is not None:
+                    for i, ws in enumerate(batch_ws):
+                        wlen = wlens[i]
+                        s = 0 if ws == 0 else max(wlen - stride, 0)
+                        if wlen - s > 0:
+                            lsh_cache.update(hidden_states[i, s:wlen], y_batch[i, s:wlen])
 
                 # Update logit calibrator with scored tokens AFTER scoring (legal)
                 if logit_cal is not None:
