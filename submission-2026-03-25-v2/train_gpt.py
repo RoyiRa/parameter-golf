@@ -213,7 +213,7 @@ class NgramEvalCache:
 
     def __init__(self, max_order=5, buckets=4_194_304, min_count=2,
                  alpha_low=0.05, alpha_high=0.40, entropy_thresh=4.0,
-                 backoff=True, entropy_adaptive=True):
+                 backoff=True, entropy_adaptive=True, geometric=False):
         self.max_order = max_order
         self.buckets = buckets
         self.min_count = min_count
@@ -222,6 +222,7 @@ class NgramEvalCache:
         self.entropy_thresh = entropy_thresh
         self.backoff = backoff
         self.entropy_adaptive = entropy_adaptive
+        self.geometric = geometric
         self.mask = np.uint64(buckets - 1)
         self.ctx_tables: dict[int, np.ndarray] = {}
         self.full_tables: dict[int, np.ndarray] = {}
@@ -1109,6 +1110,7 @@ def eval_val_sliding_ttt(
         entropy_thresh=float(os.environ.get("NGRAM_ENTROPY_THRESH", "4.0")),
         backoff=os.environ.get("NGRAM_BACKOFF", "1") == "1",
         entropy_adaptive=os.environ.get("NGRAM_ENTROPY_ADAPTIVE", "1") == "1",
+        geometric=os.environ.get("NGRAM_GEOMETRIC", "0") == "1",
     ) if use_ngram_cache else None
     val_np = val_tokens.cpu().numpy().astype(np.int64) if use_ngram_cache else None
     if use_ngram_cache and rank == 0:
@@ -1271,9 +1273,19 @@ def eval_val_sliding_ttt(
                         p_ng, has_match = ngram_cache.lookup(val_np, tgt_pos, tgt_toks)
                         if has_match.any():
                             alpha = ngram_cache.get_alpha(ent)
-                            blended = np.where(has_match,
-                                              (1.0 - alpha) * p_model + alpha * p_ng,
-                                              p_model)
+                            if ngram_cache.geometric:
+                                # Geometric (log-linear) interpolation:
+                                # p_final = p_model^(1-α) * p_ng^α  (unnormalized, but for single-token scoring NLL this is equivalent)
+                                log_p_model = np.log(np.clip(p_model, 1e-12, 1.0))
+                                log_p_ng = np.log(np.clip(p_ng, 1e-12, 1.0))
+                                blended_log = np.where(has_match,
+                                                      (1.0 - alpha) * log_p_model + alpha * log_p_ng,
+                                                      log_p_model)
+                                blended = np.exp(blended_log)
+                            else:
+                                blended = np.where(has_match,
+                                                  (1.0 - alpha) * p_model + alpha * p_ng,
+                                                  p_model)
                             blended = np.clip(blended, 1e-12, 1.0)
                             scored_nll = torch.from_numpy(-np.log(blended)).to(
                                 device=nll.device, dtype=torch.float64)
