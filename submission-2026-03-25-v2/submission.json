@@ -1,0 +1,15 @@
+{
+  "track": "10min_16mb",
+  "date": "2026-03-25",
+  "name": "Record: N-gram Eval Cache + Hedge Mixer + CROWN-Q + TTT (val_bpb=0.9897)",
+  "author": "royi",
+  "github": "RoyiRa",
+  "seed_results": {
+    "1337": {"val_loss": 1.66907090, "val_bpb": 0.98852042, "artifact_bytes": 15935233},
+    "42":   {"val_loss": 1.67597773, "val_bpb": 0.99261104, "artifact_bytes": 15418762},
+    "7":    {"val_loss": 1.66827842, "val_bpb": 0.98805106, "artifact_bytes": 15247071}
+  },
+  "mean_val_loss": 1.67110902,
+  "mean_val_bpb": 0.98972751,
+  "code_bytes": 104864
+}
