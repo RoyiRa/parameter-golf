@@ -203,6 +203,54 @@ class LogisticContextMixer:
             self.log_weights -= self.eta * expert_mean_loss
 
 
+class OnlineLogitCalibrator:
+    """Online calibration of model logits using scored token statistics.
+
+    Tracks per-token empirical frequency vs model predicted probability from
+    already-scored data. Applies a log-ratio correction to logits before scoring.
+    Score-first legal: calibration built only from already-scored tokens.
+    """
+
+    def __init__(self, vocab_size: int, device: str = 'cuda', momentum: float = 0.999):
+        self.V = vocab_size
+        self.device = device
+        self.momentum = momentum
+        # Smoothed per-token statistics
+        self.target_ema = torch.zeros(vocab_size, device=device, dtype=torch.float64)
+        self.pred_ema = torch.zeros(vocab_size, device=device, dtype=torch.float64)
+        self.total_tokens = 0
+
+    def get_logit_bias(self) -> torch.Tensor | None:
+        """Compute per-token logit bias from accumulated statistics."""
+        if self.total_tokens < 50000:
+            return None  # not enough data for reliable calibration
+        # Empirical frequency vs model's average predicted probability
+        target_freq = self.target_ema / self.target_ema.sum().clamp(min=1)
+        pred_freq = self.pred_ema / self.pred_ema.sum().clamp(min=1)
+        # Log ratio: positive = model under-predicts, negative = over-predicts
+        ratio = (target_freq + 1e-8) / (pred_freq + 1e-8)
+        return torch.log(ratio).float().clamp(-2.0, 2.0)  # clamp for stability
+
+    def update(self, logits: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor):
+        """Update statistics from scored tokens. Call AFTER scoring."""
+        with torch.no_grad():
+            probs = F.softmax(logits.float(), dim=-1)  # [bsz, slen, V]
+            # Masked average predicted probability per token
+            masked_probs = probs * mask.unsqueeze(-1).float()
+            avg_probs = masked_probs.sum(dim=(0, 1))  # [V]
+            # Masked target counts
+            masked_targets = targets.clone()
+            masked_targets[~mask] = 0
+            target_counts = torch.zeros(self.V, device=self.device, dtype=torch.float64)
+            target_counts.scatter_add_(0, masked_targets.reshape(-1).long(),
+                                       mask.reshape(-1).to(torch.float64))
+            n_tokens = mask.sum().item()
+            if n_tokens > 0:
+                self.target_ema = self.momentum * self.target_ema + (1 - self.momentum) * target_counts
+                self.pred_ema = self.momentum * self.pred_ema + (1 - self.momentum) * avg_probs.double()
+                self.total_tokens += n_tokens
+
+
 class NgramEvalCache:
     """Hashed n-gram count tables for eval-time interpolation (score-first legal).
 
@@ -213,7 +261,8 @@ class NgramEvalCache:
 
     def __init__(self, max_order=5, buckets=4_194_304, min_count=2,
                  alpha_low=0.05, alpha_high=0.40, entropy_thresh=4.0,
-                 backoff=True, entropy_adaptive=True, geometric=False):
+                 backoff=True, entropy_adaptive=True, geometric=False,
+                 count_weighted=False, blend_orders=False):
         self.max_order = max_order
         self.buckets = buckets
         self.min_count = min_count
@@ -223,6 +272,8 @@ class NgramEvalCache:
         self.backoff = backoff
         self.entropy_adaptive = entropy_adaptive
         self.geometric = geometric
+        self.count_weighted = count_weighted
+        self.blend_orders = blend_orders
         self.mask = np.uint64(buckets - 1)
         self.ctx_tables: dict[int, np.ndarray] = {}
         self.full_tables: dict[int, np.ndarray] = {}
@@ -231,7 +282,7 @@ class NgramEvalCache:
             self.full_tables[n] = np.zeros(buckets, dtype=np.uint32)
 
     def lookup(self, val_np, target_pos, targets):
-        """Vectorized n-gram lookup with multi-order backoff.
+        """Vectorized n-gram lookup with backoff or CTW-style multi-order blending.
 
         Args:
             val_np: full validation token array (numpy int64)
@@ -239,13 +290,59 @@ class NgramEvalCache:
             targets: target token values, shape (seg_len,)
 
         Returns:
-            (p_ngram, has_match): both shape (seg_len,)
+            (p_ngram, has_match, match_counts): all shape (seg_len,)
         """
         seg_len = len(target_pos)
+        tgt_u64 = targets.astype(np.uint64)
+        n_primes = len(self.PRIMES)
+
+        if self.blend_orders:
+            # CTW-inspired: blend ALL matching orders weighted by evidence
+            weighted_p = np.zeros(seg_len, dtype=np.float64)
+            weight_sum = np.zeros(seg_len, dtype=np.float64)
+            total_counts = np.zeros(seg_len, dtype=np.float64)
+            has_match = np.zeros(seg_len, dtype=bool)
+
+            for n in range(self.max_order, 1, -1):
+                ctx_w = n - 1
+                eligible = target_pos >= ctx_w
+                if not eligible.any():
+                    continue
+                idx = np.where(eligible)[0]
+                pos = target_pos[idx]
+                tgt = tgt_u64[idx]
+                ctx_hash = np.zeros(len(idx), dtype=np.uint64)
+                for k in range(ctx_w):
+                    toks = val_np[pos - ctx_w + k].astype(np.uint64)
+                    ctx_hash ^= toks * self.PRIMES[k % n_primes]
+                ctx_key = (ctx_hash & self.mask).astype(np.intp)
+                ctx_counts = self.ctx_tables[n][ctx_key]
+                sufficient = ctx_counts >= self.min_count
+                if not sufficient.any():
+                    continue
+                s_idx = idx[sufficient]
+                s_ctx = ctx_counts[sufficient].astype(np.float64)
+                full_hash = ctx_hash[sufficient] ^ (tgt[sufficient] * self.PRIMES[ctx_w % n_primes])
+                full_key = (full_hash & self.mask).astype(np.intp)
+                s_full = self.full_tables[n][full_key].astype(np.float64)
+                p_ng = np.clip(np.minimum(s_full, s_ctx) / np.maximum(s_ctx, 1.0), 0.0, 1.0)
+                # Weight by log-evidence: higher counts = more reliable
+                w = np.log2(s_ctx + 1) * n  # also weight by order (higher order = more specific)
+                weighted_p[s_idx] += w * p_ng
+                weight_sum[s_idx] += w
+                total_counts[s_idx] = np.maximum(total_counts[s_idx], s_ctx)
+                has_match[s_idx] = True
+
+            best_p = np.zeros(seg_len, dtype=np.float64)
+            blend_mask = weight_sum > 0
+            best_p[blend_mask] = weighted_p[blend_mask] / weight_sum[blend_mask]
+            return best_p, has_match, total_counts
+
+        # Standard backoff: use highest matching order
         best_p = np.zeros(seg_len, dtype=np.float64)
         has_match = np.zeros(seg_len, dtype=bool)
+        match_counts = np.zeros(seg_len, dtype=np.float64)
         orders = range(self.max_order, 1, -1) if self.backoff else [self.max_order]
-        tgt_u64 = targets.astype(np.uint64)
 
         for n in orders:
             ctx_w = n - 1
@@ -256,7 +353,6 @@ class NgramEvalCache:
             pos = target_pos[idx]
             tgt = tgt_u64[idx]
             ctx_hash = np.zeros(len(idx), dtype=np.uint64)
-            n_primes = len(self.PRIMES)
             for k in range(ctx_w):
                 toks = val_np[pos - ctx_w + k].astype(np.uint64)
                 ctx_hash ^= toks * self.PRIMES[k % n_primes]
@@ -272,9 +368,10 @@ class NgramEvalCache:
             s_full = self.full_tables[n][full_key].astype(np.float64)
             p_ng = np.minimum(s_full, s_ctx) / np.maximum(s_ctx, 1.0)
             best_p[s_idx] = np.clip(p_ng, 0.0, 1.0)
+            match_counts[s_idx] = s_ctx
             has_match[s_idx] = True
 
-        return best_p, has_match
+        return best_p, has_match, match_counts
 
     def get_alpha(self, entropy):
         """Per-token blending alpha from model entropy (nats)."""
@@ -1111,11 +1208,23 @@ def eval_val_sliding_ttt(
         backoff=os.environ.get("NGRAM_BACKOFF", "1") == "1",
         entropy_adaptive=os.environ.get("NGRAM_ENTROPY_ADAPTIVE", "1") == "1",
         geometric=os.environ.get("NGRAM_GEOMETRIC", "0") == "1",
+        count_weighted=os.environ.get("NGRAM_COUNT_WEIGHTED", "0") == "1",
+        blend_orders=os.environ.get("NGRAM_BLEND_ORDERS", "0") == "1",
     ) if use_ngram_cache else None
     val_np = val_tokens.cpu().numpy().astype(np.int64) if use_ngram_cache else None
     if use_ngram_cache and rank == 0:
         print(f"  N-gram eval cache: order={ngram_cache.max_order} buckets={ngram_cache.buckets} "
               f"backoff={ngram_cache.backoff} entropy_adaptive={ngram_cache.entropy_adaptive}")
+
+    # Online logit calibration
+    use_logit_cal = os.environ.get("USE_LOGIT_CAL", "0") == "1"
+    logit_cal = OnlineLogitCalibrator(
+        vocab_size=val_tokens.to(torch.int32).max().item() + 1,
+        device=device,
+        momentum=float(os.environ.get("LOGIT_CAL_MOMENTUM", "0.999")),
+    ) if use_logit_cal else None
+    if use_logit_cal and rank == 0:
+        print(f"  Online logit calibration enabled: momentum={logit_cal.momentum}")
 
     # Pre-compute all window starts
     window_starts = [ws for ws in range(0, total_tokens, stride)
@@ -1239,6 +1348,12 @@ def eval_val_sliding_ttt(
                         adaptive_temp = adaptive_temp.clamp(min=0.9, max=1.05)
                         logits_scaled = logits.float() / adaptive_temp.unsqueeze(-1)
 
+                # Online logit calibration: apply learned bias before scoring
+                if logit_cal is not None:
+                    _cal_bias = logit_cal.get_logit_bias()
+                    if _cal_bias is not None:
+                        logits_scaled = logits_scaled + _cal_bias.unsqueeze(0).unsqueeze(0)
+
                 # Logistic context mixing (GPU-vectorized) or plain CE
                 expert_nll = None
                 if mixer is not None:
@@ -1270,9 +1385,13 @@ def eval_val_sliding_ttt(
                         ent = _entropy_batch[i, s:wlen].cpu().numpy().astype(np.float64)
                         tgt_pos = np.arange(ws + s + 1, ws + wlen + 1)
                         tgt_toks = val_np[tgt_pos]
-                        p_ng, has_match = ngram_cache.lookup(val_np, tgt_pos, tgt_toks)
+                        p_ng, has_match, match_counts = ngram_cache.lookup(val_np, tgt_pos, tgt_toks)
                         if has_match.any():
                             alpha = ngram_cache.get_alpha(ent)
+                            # Count-weighted: scale alpha by confidence in the n-gram estimate
+                            if ngram_cache.count_weighted:
+                                count_conf = np.minimum(np.log2(match_counts + 1) / 5.0, 1.0)
+                                alpha = alpha * count_conf
                             if ngram_cache.geometric:
                                 # Geometric (log-linear) interpolation:
                                 # p_final = p_model^(1-α) * p_ng^α  (unnormalized, but for single-token scoring NLL this is equivalent)
@@ -1308,6 +1427,15 @@ def eval_val_sliding_ttt(
                         s = 0 if ws == 0 else max(wlen - stride, 0)
                         if wlen - s > 0:
                             ngram_cache.update(val_np, ws + s + 1, ws + wlen)
+
+                # Update logit calibrator with scored tokens AFTER scoring (legal)
+                if logit_cal is not None:
+                    cal_mask = torch.zeros(bsz, seq_len, dtype=torch.bool, device=device)
+                    for i, ws in enumerate(batch_ws):
+                        wlen = wlens[i]
+                        s = 0 if ws == 0 else max(wlen - stride, 0)
+                        cal_mask[i, s:wlen] = True
+                    logit_cal.update(logits_scaled, y_batch, cal_mask)
 
         # --- Update context mixer with scored chunk tokens (GPU-vectorized) ---
         chunk_start_tok = ci * ttt_chunk_tokens
