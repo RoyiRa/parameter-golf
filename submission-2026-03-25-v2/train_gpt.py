@@ -1413,6 +1413,12 @@ def eval_val_sliding_ttt(
 
     t0 = time.perf_counter()
 
+    # Document boundary detection: track per-chunk loss for spike detection
+    use_boundary_detect = os.environ.get("USE_BOUNDARY_DETECT", "0") == "1"
+    boundary_reset_alpha = float(os.environ.get("BOUNDARY_RESET_ALPHA", "0.3"))
+    recent_chunk_losses: list[float] = []
+    base_polyak_state = {id(p): p.data.clone() for p in ttt_params} if use_boundary_detect else None
+
     for ci in range(num_chunks):
         windows = chunk_windows[ci]
         if not windows:
@@ -1592,6 +1598,24 @@ def eval_val_sliding_ttt(
         chunk_end_tok = min((ci + 1) * ttt_chunk_tokens, total_tokens)
         if mixer is not None:
             mixer.update(val_tokens[chunk_start_tok:chunk_end_tok + 1])
+
+        # Document boundary detection: if chunk loss spikes, partially reset Polyak
+        if use_boundary_detect and use_polyak and token_count.item() > 0 and ci > 5:
+            chunk_loss_approx = loss_sum.item() / max(token_count.item(), 1)
+            recent_chunk_losses.append(chunk_loss_approx)
+            if len(recent_chunk_losses) > 20:
+                recent_chunk_losses.pop(0)
+            if len(recent_chunk_losses) >= 5:
+                recent_mean = sum(recent_chunk_losses[-5:]) / 5
+                overall_mean = sum(recent_chunk_losses) / len(recent_chunk_losses)
+                # Spike detection: recent loss much higher than overall
+                if recent_mean > overall_mean * 1.3:
+                    # Partially reset Polyak toward base model weights
+                    for p in ttt_params:
+                        pid = id(p)
+                        polyak_state[pid].lerp_(base_polyak_state[pid], boundary_reset_alpha)
+                    if rank == 0:
+                        print(f"  boundary_detected chunk={ci} reset_alpha={boundary_reset_alpha}", flush=True)
 
         # Swap back training weights after scoring
         if use_polyak and ci > 0:
