@@ -206,10 +206,10 @@ class LogisticContextMixer:
 class NgramEvalCache:
     """Hashed n-gram count tables for eval-time interpolation (score-first legal).
 
-    Multi-order backoff (2-5 gram) with entropy-adaptive alpha.
+    Multi-order backoff (2-7 gram) with entropy-adaptive alpha.
     Tables updated only AFTER scoring each segment.
     """
-    PRIMES = np.array([36313, 27191, 51647, 81929, 131071], dtype=np.uint64)
+    PRIMES = np.array([36313, 27191, 51647, 81929, 131071, 196613, 262147], dtype=np.uint64)
 
     def __init__(self, max_order=5, buckets=4_194_304, min_count=2,
                  alpha_low=0.05, alpha_high=0.40, entropy_thresh=4.0,
@@ -255,9 +255,10 @@ class NgramEvalCache:
             pos = target_pos[idx]
             tgt = tgt_u64[idx]
             ctx_hash = np.zeros(len(idx), dtype=np.uint64)
+            n_primes = len(self.PRIMES)
             for k in range(ctx_w):
                 toks = val_np[pos - ctx_w + k].astype(np.uint64)
-                ctx_hash ^= toks * self.PRIMES[k]
+                ctx_hash ^= toks * self.PRIMES[k % n_primes]
             ctx_key = (ctx_hash & self.mask).astype(np.intp)
             ctx_counts = self.ctx_tables[n][ctx_key]
             sufficient = ctx_counts >= self.min_count
@@ -265,7 +266,7 @@ class NgramEvalCache:
                 continue
             s_idx = idx[sufficient]
             s_ctx = ctx_counts[sufficient].astype(np.float64)
-            full_hash = ctx_hash[sufficient] ^ (tgt[sufficient] * self.PRIMES[ctx_w % 5])
+            full_hash = ctx_hash[sufficient] ^ (tgt[sufficient] * self.PRIMES[ctx_w % n_primes])
             full_key = (full_hash & self.mask).astype(np.intp)
             s_full = self.full_tables[n][full_key].astype(np.float64)
             p_ng = np.minimum(s_full, s_ctx) / np.maximum(s_ctx, 1.0)
@@ -291,11 +292,12 @@ class NgramEvalCache:
             positions = np.arange(start, target_end + 1)
             tgt = val_np[positions].astype(np.uint64)
             ctx_hash = np.zeros(len(positions), dtype=np.uint64)
+            n_primes = len(self.PRIMES)
             for k in range(ctx_w):
                 toks = val_np[positions - ctx_w + k].astype(np.uint64)
-                ctx_hash ^= toks * self.PRIMES[k]
+                ctx_hash ^= toks * self.PRIMES[k % n_primes]
             ctx_key = (ctx_hash & self.mask).astype(np.intp)
-            full_hash = ctx_hash ^ (tgt * self.PRIMES[ctx_w % 5])
+            full_hash = ctx_hash ^ (tgt * self.PRIMES[ctx_w % n_primes])
             full_key = (full_hash & self.mask).astype(np.intp)
             np.add.at(self.ctx_tables[n], ctx_key, 1)
             np.add.at(self.full_tables[n], full_key, 1)
