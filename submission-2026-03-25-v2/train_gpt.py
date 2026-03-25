@@ -337,6 +337,8 @@ class NgramEvalCache:
         self.count_weighted = count_weighted
         self.blend_orders = blend_orders
         self.use_negative = bool(int(os.environ.get("NGRAM_USE_NEGATIVE", "0")))
+        self.online_alpha = bool(int(os.environ.get("NGRAM_ONLINE_ALPHA", "0")))
+        self.learned_alpha = alpha_high  # start at alpha_high, learn from there
         self.mask = np.uint64(buckets - 1)
         self.ctx_tables: dict[int, np.ndarray] = {}
         self.full_tables: dict[int, np.ndarray] = {}
@@ -450,10 +452,31 @@ class NgramEvalCache:
 
     def get_alpha(self, entropy):
         """Per-token blending alpha from model entropy (nats)."""
+        if self.online_alpha:
+            # Use online-learned alpha (overrides entropy-adaptive)
+            return np.full_like(entropy, self.learned_alpha)
         if self.entropy_adaptive:
             sig = 1.0 / (1.0 + np.exp(-2.0 * (entropy - self.entropy_thresh)))
             return self.alpha_low + (self.alpha_high - self.alpha_low) * sig
         return np.full_like(entropy, (self.alpha_low + self.alpha_high) / 2)
+
+    def update_online_alpha(self, p_model, p_ng, has_match, targets_nll_model):
+        """Online gradient descent on alpha to minimize blending loss."""
+        if not self.online_alpha or not has_match.any():
+            return
+        # Compute loss at current alpha and alpha +/- epsilon
+        eps = 0.02
+        a = self.learned_alpha
+        matched = has_match
+        pm = p_model[matched]
+        pn = p_ng[matched]
+        loss_cur = -np.log(np.clip((1-a)*pm + a*pn, 1e-12, 1.0)).mean()
+        loss_up = -np.log(np.clip((1-a-eps)*pm + (a+eps)*pn, 1e-12, 1.0)).mean()
+        loss_dn = -np.log(np.clip((1-a+eps)*pm + (a-eps)*pn, 1e-12, 1.0)).mean()
+        # Finite difference gradient
+        grad = (loss_up - loss_dn) / (2 * eps)
+        self.learned_alpha -= 0.01 * grad  # SGD step
+        self.learned_alpha = max(0.05, min(0.95, self.learned_alpha))
 
     def update(self, val_np, target_start, target_end):
         """Update tables with scored tokens (target_start..target_end inclusive)."""
@@ -1575,6 +1598,12 @@ def eval_val_sliding_ttt(
                         s = 0 if ws == 0 else max(wlen - stride, 0)
                         if wlen - s > 0:
                             ngram_cache.update(val_np, ws + s + 1, ws + wlen)
+                            # Online alpha learning (after n-gram update)
+                            if ngram_cache.online_alpha and seg_len > 0:
+                                _pm = torch.exp(-nll[i, s:wlen]).cpu().numpy().astype(np.float64)
+                                _tgt = val_np[np.arange(ws + s + 1, ws + wlen + 1)]
+                                _png, _hm, _, _ = ngram_cache.lookup(val_np, np.arange(ws + s + 1, ws + wlen + 1), _tgt)
+                                ngram_cache.update_online_alpha(_pm, _png, _hm, None)
 
                 # Update LSH semantic cache with scored tokens AFTER scoring (legal)
                 if lsh_cache is not None and hidden_states is not None:
