@@ -1,4 +1,4 @@
-# Record: Phrase Automaton + Order-Adaptive N-gram + Regime Tracker + TTT (val_bpb=0.1003)
+# Record: Phrase Cache + Order-Adaptive N-gram + Regime Tracker + TTT (val_bpb=0.1003)
 
 **val_bpb: 0.1003** (3-seed mean) | **~15.7 MB** | 8xH100 SXM
 
@@ -13,7 +13,7 @@
 
 ## Key Techniques
 
-### 1. Long Phrase Automaton (eval-time, novel)
+### 1. Long Phrase Cache (eval-time, novel)
 Variable-length suffix matcher that complements the fixed-order n-gram cache. Probes at lengths [48, 36, 28, 20, 16] using rolling hashes. When a 48-token suffix matches previously scored text, it's almost certainly an exact copy (boilerplate, markup, legal text) — gets alpha near 0.99.
 
 Exploits the massive verbatim repetition in web text that fixed-order n-grams (even order 9) miss: cookie banners, navigation menus, code headers, list structures, copyright notices.
@@ -53,7 +53,7 @@ GPU-vectorized Hedge mixer. Quantization-aware penalty. 5% magnitude pruning. zs
 | CROWN-Q | lambda=0.01 during warmdown |
 | TTT | AdamW lr=0.0001, 2 epochs, 131K chunks, Polyak 0.998 |
 | N-gram cache | Orders 2-9, 4M buckets, order-adaptive gating |
-| Phrase automaton | Probes [48, 36, 28, 20, 16], 4M buckets |
+| Phrase cache | Probes [48, 36, 28, 20, 16], 4M buckets |
 | Regime tracker | Window=4096, alpha mult [0.7, 1.5] |
 | Temperature | 0.85 (adaptive per-token) |
 

@@ -302,7 +302,7 @@ class LogisticContextMixer:
             self.log_weights -= self.eta * expert_mean_loss
 
 
-class LongPhraseAutomaton:
+class LongPhraseCache:
     """Long-phrase suffix matcher for copy-mode compression.
 
     Complements the fixed-order n-gram cache (orders 2-12) by matching
@@ -1592,13 +1592,13 @@ def eval_val_sliding_ttt(
 
     # Variable-length phrase cache (PPM/LZ-inspired)
     use_phrase = os.environ.get("USE_PHRASE_CACHE", "0") == "1"
-    phrase_cache = LongPhraseAutomaton(
+    phrase_cache = LongPhraseCache(
         buckets=int(os.environ.get("PHRASE_BUCKETS", "4194304")),
         min_count=int(os.environ.get("PHRASE_MIN_COUNT", "1")),
         base_alpha=float(os.environ.get("PHRASE_ALPHA", "0.90")),
     ) if use_phrase else None
     if use_phrase and rank == 0:
-        print(f"  Long phrase automaton: probes={LongPhraseAutomaton.PROBE_LENGTHS} "
+        print(f"  Long phrase automaton: probes={LongPhraseCache.PROBE_LENGTHS} "
               f"alpha={phrase_cache.base_alpha}")
 
     # Regime tracker for document-type-adaptive alpha
