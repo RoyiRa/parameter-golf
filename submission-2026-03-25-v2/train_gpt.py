@@ -72,6 +72,68 @@ class TrainNgramTracker:
         self.bi_totals.scatter_add_(0, prev, ones)
 
 
+class RegimeTracker:
+    """Online document regime detector for alpha modulation.
+
+    Tracks cheap features from scored tokens to detect text regimes:
+    boilerplate/menus (high repetition → boost n-gram), fresh prose
+    (low repetition → trust model), code-like (high punctuation),
+    lists/tables (high structure). Adjusts n-gram alpha multiplier
+    based on detected regime.
+
+    Features (all computed from already-scored tokens):
+    - ngram_hit_rate: fraction of recent positions with n-gram match
+    - avg_match_order: mean matched n-gram order (higher = more repetitive)
+    - token_diversity: unique tokens / total in recent window
+    - punctuation_density: fraction of "structural" tokens (short, non-alpha)
+    """
+
+    def __init__(self, window_size: int = 4096):
+        self.window_size = window_size
+        # Rolling statistics
+        self.match_history: list[float] = []  # per-batch match rates
+        self.order_history: list[float] = []  # per-batch avg match orders
+        self.diversity_history: list[float] = []  # per-batch token diversity
+        self.regime_alpha_mult = 1.0  # current multiplier
+
+    def update(self, n_matches: int, n_total: int, avg_order: float,
+               tokens: np.ndarray):
+        """Update regime statistics from a scored batch."""
+        if n_total == 0:
+            return
+        self.match_history.append(n_matches / n_total)
+        self.order_history.append(avg_order)
+        # Token diversity: unique tokens / total in this batch
+        if len(tokens) > 0:
+            self.diversity_history.append(len(np.unique(tokens)) / len(tokens))
+        # Keep window bounded
+        max_entries = self.window_size // 64  # ~64 entries for 4096-token window
+        for h in (self.match_history, self.order_history, self.diversity_history):
+            while len(h) > max_entries:
+                h.pop(0)
+        # Recompute regime multiplier
+        self._update_multiplier()
+
+    def _update_multiplier(self):
+        """Compute alpha multiplier from recent regime features."""
+        if len(self.match_history) < 3:
+            self.regime_alpha_mult = 1.0
+            return
+        # Recent match rate: high = repetitive regime
+        recent_match = np.mean(self.match_history[-10:])
+        # Recent diversity: low = repetitive (boilerplate, lists, code)
+        recent_div = np.mean(self.diversity_history[-10:]) if self.diversity_history else 0.5
+        # Combine: high match rate + low diversity = very repetitive → boost
+        repetitiveness = recent_match * (1.0 - recent_div * 0.5)
+        # Map to multiplier: [0.7, 1.5]
+        # Very repetitive (rep > 0.6): mult up to 1.5
+        # Novel (rep < 0.2): mult down to 0.7
+        self.regime_alpha_mult = 0.7 + 0.8 * np.clip(repetitiveness, 0, 1)
+
+    def get_alpha_multiplier(self) -> float:
+        return self.regime_alpha_mult
+
+
 class LogisticContextMixer:
     """GPU-vectorized logistic context mixing (inspired by PAQ compression).
 
@@ -1549,6 +1611,14 @@ def eval_val_sliding_ttt(
         print(f"  Phrase cache: max_len={phrase_cache.max_len} min_len={phrase_cache.min_len} "
               f"alpha={phrase_cache.alpha} length_bonus={phrase_cache.length_bonus}")
 
+    # Regime tracker for document-type-adaptive alpha
+    use_regime = os.environ.get("USE_REGIME_TRACKER", "0") == "1"
+    regime_tracker = RegimeTracker(
+        window_size=int(os.environ.get("REGIME_WINDOW", "4096")),
+    ) if use_regime else None
+    if use_regime and rank == 0:
+        print(f"  Regime tracker: window={regime_tracker.window_size}")
+
     # LSH semantic cache
     use_lsh = os.environ.get("USE_LSH_CACHE", "0") == "1"
     lsh_cache = LSHSemanticCache(
@@ -1716,6 +1786,9 @@ def eval_val_sliding_ttt(
                         _lp = F.log_softmax(logits_scaled.float(), dim=-1)
                         _entropy_batch = -(_lp.exp() * _lp).sum(-1)
 
+                _last_batch_matches = 0
+                _last_batch_order_sum = 0.0
+
                 for i, ws in enumerate(batch_ws):
                     wlen = wlens[i]
                     s = 0 if ws == 0 else max(wlen - stride, 0)
@@ -1733,11 +1806,16 @@ def eval_val_sliding_ttt(
                         if has_negative.any() and neg_penalty < 1.0:
                             p_model[has_negative] *= neg_penalty
                         if has_match.any():
+                            _last_batch_matches += int(has_match.sum())
+                            _last_batch_order_sum += float(match_orders[has_match].sum())
                             alpha = ngram_cache.get_alpha(ent, match_orders)
                             # Count-weighted: scale alpha by confidence in the n-gram estimate
                             if ngram_cache.count_weighted:
                                 count_conf = np.minimum(np.log2(match_counts + 1) / 5.0, 1.0)
                                 alpha = alpha * count_conf
+                            # Regime-adaptive: modulate alpha by document type
+                            if regime_tracker is not None:
+                                alpha = np.clip(alpha * regime_tracker.get_alpha_multiplier(), 0, 0.99)
                             if ngram_cache.geometric:
                                 # Geometric (log-linear) interpolation:
                                 # p_final = p_model^(1-α) * p_ng^α  (unnormalized, but for single-token scoring NLL this is equivalent)
@@ -1806,6 +1884,26 @@ def eval_val_sliding_ttt(
 
                 # N-gram cache per-window updates removed — full-chunk update below
                 # ensures ALL ranks see ALL scored tokens (8x more data)
+
+                # Update regime tracker with batch statistics
+                if regime_tracker is not None:
+                    batch_matches = 0
+                    batch_total = 0
+                    batch_order_sum = 0.0
+                    batch_tokens_list = []
+                    for i, ws in enumerate(batch_ws):
+                        wlen = wlens[i]
+                        s = 0 if ws == 0 else max(wlen - stride, 0)
+                        if wlen - s > 0:
+                            batch_total += wlen - s
+                            batch_tokens_list.append(val_np[ws + s + 1:ws + wlen + 1])
+                    # Use stats from n-gram scoring if available
+                    if '_last_batch_matches' in dir():
+                        batch_matches = _last_batch_matches
+                        batch_order_sum = _last_batch_order_sum
+                    all_toks = np.concatenate(batch_tokens_list) if batch_tokens_list else np.array([])
+                    regime_tracker.update(batch_matches, batch_total,
+                                        batch_order_sum / max(batch_matches, 1), all_toks)
 
                 # Update LSH semantic cache with scored tokens AFTER scoring (legal)
                 if lsh_cache is not None and hidden_states is not None:
