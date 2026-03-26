@@ -35,6 +35,43 @@ except ImportError:
         _HAS_FA3 = False
         flash_attn_3_func = None
 
+class TrainNgramTracker:
+    """Online bigram tracker for complementary training.
+
+    Maintains bigram counts from training data to downweight tokens
+    that are easily predictable by n-gram statistics. This makes the
+    neural model focus its capacity on hard-to-predict tokens,
+    complementing the eval-time n-gram cache.
+    """
+
+    def __init__(self, vocab_size: int, device: str, complement_alpha: float = 0.5):
+        self.V = vocab_size
+        self.device = device
+        self.complement_alpha = complement_alpha
+        self.bi_counts = torch.zeros(vocab_size, vocab_size, device=device)
+        self.bi_totals = torch.zeros(vocab_size, device=device)
+
+    def get_weights(self, x: Tensor, y: Tensor) -> Tensor:
+        """Get per-token loss weights. Low weight = n-gram predictable."""
+        prev = x.reshape(-1).long()
+        target = y.reshape(-1).long()
+        counts = self.bi_counts[prev, target]
+        totals = self.bi_totals[prev]
+        ngram_prob = counts / (totals + 1.0)
+        weights = (1.0 - self.complement_alpha * ngram_prob).clamp(min=0.1)
+        return weights.reshape(y.shape)
+
+    @torch.no_grad()
+    def update(self, x: Tensor, y: Tensor):
+        """Update bigram counts from training batch."""
+        prev = x.reshape(-1).long()
+        target = y.reshape(-1).long()
+        idx = prev * self.V + target
+        ones = torch.ones(idx.numel(), device=self.device)
+        self.bi_counts.reshape(-1).scatter_add_(0, idx, ones)
+        self.bi_totals.scatter_add_(0, prev, ones)
+
+
 class LogisticContextMixer:
     """GPU-vectorized logistic context mixing (inspired by PAQ compression).
 
@@ -1301,6 +1338,11 @@ class GPT(nn.Module):
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x_flat)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        # Complementary training: downweight n-gram-predictable tokens
+        if self.training and hasattr(self, '_ngram_tracker') and self._ngram_tracker is not None:
+            per_tok_loss = F.cross_entropy(logits.float(), targets, reduction="none")
+            weights = self._ngram_tracker.get_weights(input_ids, target_ids)
+            return (per_tok_loss * weights.reshape(-1)).mean()
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
@@ -2420,6 +2462,14 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+    # Complementary training: downweight n-gram-predictable tokens
+    complement_alpha = float(os.environ.get("COMPLEMENT_ALPHA", "0"))
+    if complement_alpha > 0:
+        base_model._ngram_tracker = TrainNgramTracker(args.vocab_size, device, complement_alpha)
+        log0(f"complementary_training:enabled alpha={complement_alpha}")
+    else:
+        base_model._ngram_tracker = None
+
     swa_state: dict[str, Tensor] | None = None
     swa_count = 0
     ema_state = {name: t.detach().float().clone() for name, t in base_model.state_dict().items()}
@@ -2507,6 +2557,9 @@ def main() -> None:
         for opt in optimizers:
             opt.step()
         zero_grad_all()
+        # Update complementary training bigram tracker
+        if base_model._ngram_tracker is not None:
+            base_model._ngram_tracker.update(x, y)
         with torch.no_grad():
             for name, t in base_model.state_dict().items():
                 ema_state[name].mul_(ema_decay).add_(t.detach().float(), alpha=1.0 - ema_decay)
