@@ -203,6 +203,122 @@ class LogisticContextMixer:
             self.log_weights -= self.eta * expert_mean_loss
 
 
+class VariableLengthPhraseCache:
+    """Variable-length phrase continuation cache (PPM/LZ-inspired).
+
+    Unlike fixed-order n-gram caches that try order K, K-1, ..., 2,
+    this finds the LONGEST previously seen suffix in scored tokens and
+    predicts from continuations of those prior matches. Exploits repeated
+    spans, boilerplate, markup, code patterns, and local phrase recurrence
+    better than fixed-order n-grams.
+
+    Score-first legal: only uses already-scored tokens.
+    """
+    PRIMES = np.array([36313, 27191, 51647, 81929, 131071, 196613, 262147,
+                       393241, 524309, 655373, 786433, 917521, 1048583,
+                       1179653, 1310729, 1441801, 1572871, 1703939,
+                       1835017, 1966093, 2097169, 2228243, 2359321,
+                       2490377, 2621447, 2752523, 2883593, 3014657,
+                       3145739, 3276811, 3407879, 3538961], dtype=np.uint64)
+
+    def __init__(self, max_len=24, min_len=4, buckets=4_194_304,
+                 min_count=1, alpha=0.85, length_bonus=0.02):
+        self.max_len = max_len
+        self.min_len = min_len
+        self.buckets = buckets
+        self.min_count = min_count
+        self.alpha = alpha  # base mixing weight
+        self.length_bonus = length_bonus  # bonus per matched length
+        self.mask = np.uint64(buckets - 1)
+        # Single pair of tables: ctx_table + full_table (same as n-gram cache)
+        # Key: rolling hash of the L-token context
+        self.ctx_table = np.zeros(buckets, dtype=np.uint32)
+        self.full_table = np.zeros(buckets, dtype=np.uint32)
+        self.total_tokens = 0
+
+    def _rolling_hash(self, val_np, positions, length):
+        """Compute rolling hash over (positions - length .. positions - 1) context."""
+        n_primes = len(self.PRIMES)
+        h = np.zeros(len(positions), dtype=np.uint64)
+        for k in range(length):
+            toks = val_np[positions - length + k].astype(np.uint64)
+            h ^= toks * self.PRIMES[k % n_primes]
+        return h
+
+    def lookup(self, val_np, target_pos, targets):
+        """Find longest matching suffix and predict continuation.
+
+        Tries lengths max_len, max_len-1, ..., min_len. First match wins.
+
+        Returns:
+            (p_phrase, has_match, match_lengths): all shape (seg_len,)
+        """
+        seg_len = len(target_pos)
+        best_p = np.zeros(seg_len, dtype=np.float64)
+        has_match = np.zeros(seg_len, dtype=bool)
+        match_lengths = np.zeros(seg_len, dtype=np.int32)
+        tgt_u64 = targets.astype(np.uint64)
+
+        for L in range(self.max_len, self.min_len - 1, -1):
+            eligible = (target_pos >= L) & ~has_match
+            if not eligible.any():
+                continue
+            idx = np.where(eligible)[0]
+            pos = target_pos[idx]
+            tgt = tgt_u64[idx]
+
+            ctx_hash = self._rolling_hash(val_np, pos, L)
+            ctx_key = (ctx_hash & self.mask).astype(np.intp)
+            ctx_counts = self.ctx_table[ctx_key]
+            sufficient = ctx_counts >= self.min_count
+            if not sufficient.any():
+                continue
+
+            s_idx = idx[sufficient]
+            s_ctx = ctx_counts[sufficient].astype(np.float64)
+            full_hash = ctx_hash[sufficient] ^ (tgt[sufficient] * self.PRIMES[L % len(self.PRIMES)])
+            full_key = (full_hash & self.mask).astype(np.intp)
+            s_full = self.full_table[full_key].astype(np.float64)
+
+            has_target = s_full > 0
+            if has_target.any():
+                pos_idx = s_idx[has_target]
+                pos_ctx = s_ctx[has_target]
+                pos_full = s_full[has_target]
+                p = np.minimum(pos_full, pos_ctx) / np.maximum(pos_ctx, 1.0)
+                best_p[pos_idx] = np.clip(p, 0.0, 1.0)
+                match_lengths[pos_idx] = L
+                has_match[pos_idx] = True
+
+        return best_p, has_match, match_lengths
+
+    def get_alpha(self, match_lengths, entropy):
+        """Alpha that increases with match length and model uncertainty."""
+        # Longer matches = higher confidence
+        len_factor = self.alpha + self.length_bonus * (match_lengths - self.min_len)
+        # Also modulate by entropy: uncertain model → trust phrase more
+        ent_factor = 1.0 / (1.0 + np.exp(-2.0 * (entropy - 3.0)))
+        alpha = len_factor * (0.3 + 0.7 * ent_factor)
+        return np.clip(alpha, 0.0, 0.99)
+
+    def update(self, val_np, start, end):
+        """Update tables with scored tokens (start..end inclusive)."""
+        n_primes = len(self.PRIMES)
+        for L in range(self.min_len, self.max_len + 1):
+            first = max(start, L)
+            if first > end:
+                continue
+            positions = np.arange(first, end + 1)
+            tgt = val_np[positions].astype(np.uint64)
+            ctx_hash = self._rolling_hash(val_np, positions, L)
+            ctx_key = (ctx_hash & self.mask).astype(np.intp)
+            full_hash = ctx_hash ^ (tgt * self.PRIMES[L % n_primes])
+            full_key = (full_hash & self.mask).astype(np.intp)
+            np.add.at(self.ctx_table, ctx_key, 1)
+            np.add.at(self.full_table, full_key, 1)
+        self.total_tokens += max(0, end - start + 1)
+
+
 class LSHSemanticCache:
     """Locality-sensitive hashing cache for semantic n-gram prediction.
 
@@ -1377,6 +1493,20 @@ def eval_val_sliding_ttt(
     if use_logit_cal and rank == 0:
         print(f"  Online logit calibration enabled: momentum={logit_cal.momentum}")
 
+    # Variable-length phrase cache (PPM/LZ-inspired)
+    use_phrase = os.environ.get("USE_PHRASE_CACHE", "0") == "1"
+    phrase_cache = VariableLengthPhraseCache(
+        max_len=int(os.environ.get("PHRASE_MAX_LEN", "24")),
+        min_len=int(os.environ.get("PHRASE_MIN_LEN", "4")),
+        buckets=int(os.environ.get("PHRASE_BUCKETS", "4194304")),
+        min_count=int(os.environ.get("PHRASE_MIN_COUNT", "1")),
+        alpha=float(os.environ.get("PHRASE_ALPHA", "0.85")),
+        length_bonus=float(os.environ.get("PHRASE_LENGTH_BONUS", "0.02")),
+    ) if use_phrase else None
+    if use_phrase and rank == 0:
+        print(f"  Phrase cache: max_len={phrase_cache.max_len} min_len={phrase_cache.min_len} "
+              f"alpha={phrase_cache.alpha} length_bonus={phrase_cache.length_bonus}")
+
     # LSH semantic cache
     use_lsh = os.environ.get("USE_LSH_CACHE", "0") == "1"
     lsh_cache = LSHSemanticCache(
@@ -1587,6 +1717,22 @@ def eval_val_sliding_ttt(
                     else:
                         scored_nll = nll[i, s:wlen].to(torch.float64)
 
+                    # Variable-length phrase cache blending (on top of n-gram)
+                    if phrase_cache is not None and seg_len > 0 and phrase_cache.total_tokens > 5000:
+                        p_current = torch.exp(-scored_nll).cpu().numpy().astype(np.float64)
+                        tgt_pos_p = np.arange(ws + s + 1, ws + wlen + 1)
+                        tgt_toks_p = val_np[tgt_pos_p]
+                        p_phrase, phrase_match, phrase_lens = phrase_cache.lookup(val_np, tgt_pos_p, tgt_toks_p)
+                        if phrase_match.any():
+                            ent_p = _entropy_batch[i, s:wlen].cpu().numpy().astype(np.float64) if _entropy_batch is not None else np.full(seg_len, 4.0)
+                            pa = phrase_cache.get_alpha(phrase_lens, ent_p)
+                            blended_p = np.where(phrase_match,
+                                                (1.0 - pa) * p_current + pa * p_phrase,
+                                                p_current)
+                            blended_p = np.clip(blended_p, 1e-12, 1.0)
+                            scored_nll = torch.from_numpy(-np.log(blended_p)).to(
+                                device=nll.device, dtype=torch.float64)
+
                     # LSH semantic cache blending (on top of n-gram blending)
                     if lsh_cache is not None and hidden_states is not None and seg_len > 0 and lsh_cache.total_tokens > 5000:
                         seg_hidden = hidden_states[i, s:wlen]  # [seg_len, hidden_dim]
@@ -1645,6 +1791,8 @@ def eval_val_sliding_ttt(
             mixer.update(val_tokens[chunk_start_tok:chunk_end_tok + 1])
         if ngram_cache is not None:
             ngram_cache.update(val_np, chunk_start_tok, chunk_end_tok)
+        if phrase_cache is not None:
+            phrase_cache.update(val_np, chunk_start_tok, chunk_end_tok)
 
         # Document boundary detection: if chunk loss spikes, partially reset Polyak
         if use_boundary_detect and use_polyak and token_count.item() > 0 and ci > 5:
