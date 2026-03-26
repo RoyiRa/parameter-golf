@@ -338,7 +338,8 @@ class NgramEvalCache:
         self.blend_orders = blend_orders
         self.use_negative = bool(int(os.environ.get("NGRAM_USE_NEGATIVE", "0")))
         self.online_alpha = bool(int(os.environ.get("NGRAM_ONLINE_ALPHA", "0")))
-        self.learned_alpha = alpha_high  # start at alpha_high, learn from there
+        self.learned_alpha = alpha_high
+        self.order_adaptive = bool(int(os.environ.get("NGRAM_ORDER_ADAPTIVE", "0")))
         self.mask = np.uint64(buckets - 1)
         self.ctx_tables: dict[int, np.ndarray] = {}
         self.full_tables: dict[int, np.ndarray] = {}
@@ -401,13 +402,14 @@ class NgramEvalCache:
             best_p = np.zeros(seg_len, dtype=np.float64)
             blend_mask = weight_sum > 0
             best_p[blend_mask] = weighted_p[blend_mask] / weight_sum[blend_mask]
-            return best_p, has_match, total_counts, np.zeros(seg_len, dtype=bool)
+            return best_p, has_match, total_counts, np.zeros(seg_len, dtype=bool), np.zeros(seg_len, dtype=np.int32)
 
         # Standard backoff: use highest matching order
         best_p = np.zeros(seg_len, dtype=np.float64)
         has_match = np.zeros(seg_len, dtype=bool)
         has_negative = np.zeros(seg_len, dtype=bool)  # context seen but target never
         match_counts = np.zeros(seg_len, dtype=np.float64)
+        match_orders = np.zeros(seg_len, dtype=np.int32)  # which order matched
         orders = range(self.max_order, 1, -1) if self.backoff else [self.max_order]
 
         for n in orders:
@@ -441,6 +443,7 @@ class NgramEvalCache:
                 p_ng = np.minimum(pos_full, pos_ctx) / np.maximum(pos_ctx, 1.0)
                 best_p[pos_idx] = np.clip(p_ng, 0.0, 1.0)
                 match_counts[pos_idx] = pos_ctx
+                match_orders[pos_idx] = n
                 has_match[pos_idx] = True
             # Negative evidence: context seen >= 5 times but target NEVER appeared
             neg_mask = (~has_target) & (s_ctx >= 5)
@@ -448,13 +451,35 @@ class NgramEvalCache:
                 neg_idx = s_idx[neg_mask]
                 has_negative[neg_idx] = True
 
-        return best_p, has_match, match_counts, has_negative
+        return best_p, has_match, match_counts, has_negative, match_orders
 
-    def get_alpha(self, entropy):
-        """Per-token blending alpha from model entropy (nats)."""
+    def get_alpha(self, entropy, match_orders=None):
+        """Per-token blending alpha from model entropy (nats) + matched order.
+
+        When order_adaptive=True, uses per-order entropy thresholds and multipliers:
+        - High-order matches (7+): low entropy threshold (trust even when model is OK)
+        - Low-order matches (2-3): high threshold (only when model is confused)
+        """
         if self.online_alpha:
-            # Use online-learned alpha (overrides entropy-adaptive)
             return np.full_like(entropy, self.learned_alpha)
+
+        if self.order_adaptive and match_orders is not None and self.entropy_adaptive:
+            # Per-order entropy centers: high orders → lower threshold (trust more)
+            # Linearly interpolate: order 2 → thresh_high, order max → thresh_low
+            order_frac = (match_orders - 2).astype(np.float64) / max(self.max_order - 2, 1)
+            thresh_high = self.entropy_thresh + 1.0  # ~5.0 for low orders
+            thresh_low = max(self.entropy_thresh - 2.0, 1.5)  # ~2.0 for high orders
+            per_order_thresh = thresh_high - order_frac * (thresh_high - thresh_low)
+
+            sig = 1.0 / (1.0 + np.exp(-2.0 * (entropy - per_order_thresh)))
+            base_alpha = self.alpha_low + (self.alpha_high - self.alpha_low) * sig
+
+            # Per-order multipliers: high orders boosted, low orders suppressed
+            mult_low = 0.3   # order 2
+            mult_high = 2.0  # order max
+            mult = mult_low + order_frac * (mult_high - mult_low)
+            return np.clip(base_alpha * mult, 0.0, 0.99)
+
         if self.entropy_adaptive:
             sig = 1.0 / (1.0 + np.exp(-2.0 * (entropy - self.entropy_thresh)))
             return self.alpha_low + (self.alpha_high - self.alpha_low) * sig
@@ -1530,13 +1555,13 @@ def eval_val_sliding_ttt(
                         ent = _entropy_batch[i, s:wlen].cpu().numpy().astype(np.float64)
                         tgt_pos = np.arange(ws + s + 1, ws + wlen + 1)
                         tgt_toks = val_np[tgt_pos]
-                        p_ng, has_match, match_counts, has_negative = ngram_cache.lookup(val_np, tgt_pos, tgt_toks)
+                        p_ng, has_match, match_counts, has_negative, match_orders = ngram_cache.lookup(val_np, tgt_pos, tgt_toks)
                         # Negative evidence: penalize model for tokens the n-gram has never seen in this context
                         neg_penalty = float(os.environ.get("NGRAM_NEG_PENALTY", "0.5"))
                         if has_negative.any() and neg_penalty < 1.0:
                             p_model[has_negative] *= neg_penalty
                         if has_match.any():
-                            alpha = ngram_cache.get_alpha(ent)
+                            alpha = ngram_cache.get_alpha(ent, match_orders)
                             # Count-weighted: scale alpha by confidence in the n-gram estimate
                             if ngram_cache.count_weighted:
                                 count_conf = np.minimum(np.log2(match_counts + 1) / 5.0, 1.0)
