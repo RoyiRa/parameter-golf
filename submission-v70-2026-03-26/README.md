@@ -6,9 +6,9 @@
 
 | Seed | Pre-TTT BPB | **Post-TTT BPB** | Artifact | Train time | Eval time |
 |------|-------------|-----------------|----------|------------|-----------|
-| 1337 | 1.1287 | **0.1003** | 15.74 MB | 582s | 593s |
-| 42 | 1.1277 | **0.1002** | 15.59 MB | 582s | 593s |
-| 7 | 1.1249 | **0.1003** | 15.73 MB | 582s | 590s |
+| 1337 | 1.1287 | **0.1003** | 15.74 MB | 582s | 592.4s |
+| 42 | 1.1277 | **0.1002** | 15.59 MB | 582s | 593.3s |
+| 7 | 1.1249 | **0.1003** | 15.73 MB | 582s | 590.0s |
 | **Mean** | 1.1271 | **0.1003** | | | |
 
 ## Key Techniques
@@ -62,7 +62,7 @@ GPU-vectorized Hedge mixer. Quantization-aware penalty. 5% magnitude pruning. zs
 | Constraint | Limit | Actual | Status |
 |-----------|-------|--------|--------|
 | Train time | 600s | 582s | Pass |
-| Eval time | 600s | 593s (worst seed) | Pass |
+| Eval time | 600s | 593.3s (worst seed) | Pass |
 | Artifact size | 16,000,000 bytes | 15,737,937 (worst seed) | Pass |
 | No pre-scoring training | — | Score-first TTT + backward-looking caches | Pass |
 | GPTQ in training budget | — | 1.8s within 18s reserve | Pass |
