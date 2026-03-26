@@ -302,41 +302,42 @@ class LogisticContextMixer:
             self.log_weights -= self.eta * expert_mean_loss
 
 
-class VariableLengthPhraseCache:
-    """Variable-length phrase continuation cache (PPM/LZ-inspired).
+class LongPhraseAutomaton:
+    """Long-phrase suffix matcher for copy-mode compression.
 
-    Unlike fixed-order n-gram caches that try order K, K-1, ..., 2,
-    this finds the LONGEST previously seen suffix in scored tokens and
-    predicts from continuations of those prior matches. Exploits repeated
-    spans, boilerplate, markup, code patterns, and local phrase recurrence
-    better than fixed-order n-grams.
+    Complements the fixed-order n-gram cache (orders 2-12) by matching
+    LONG repeated suffixes (16-48 tokens) using sparse geometric probes.
+    Only 5-6 probe lengths instead of 21, making it fast enough for budget.
 
-    Score-first legal: only uses already-scored tokens.
+    When a 32-token suffix matches, it's almost certainly an exact copy of
+    previously scored text (boilerplate, repeated markup, legal text, etc.).
+    These get very high alpha (near 1.0).
+
+    Score-first legal: only matches against already-scored tokens.
     """
     PRIMES = np.array([36313, 27191, 51647, 81929, 131071, 196613, 262147,
                        393241, 524309, 655373, 786433, 917521, 1048583,
                        1179653, 1310729, 1441801, 1572871, 1703939,
                        1835017, 1966093, 2097169, 2228243, 2359321,
                        2490377, 2621447, 2752523, 2883593, 3014657,
-                       3145739, 3276811, 3407879, 3538961], dtype=np.uint64)
+                       3145739, 3276811, 3407879, 3538961, 3670037,
+                       3801131, 3932203, 4063267, 4194319, 4325381,
+                       4456441, 4587503, 4718579, 4849651, 4980719,
+                       5111789, 5242877, 5373953, 5505023, 5636089], dtype=np.uint64)
 
-    def __init__(self, max_len=24, min_len=4, buckets=4_194_304,
-                 min_count=1, alpha=0.85, length_bonus=0.02):
-        self.max_len = max_len
-        self.min_len = min_len
+    # Sparse geometric probes: only check these lengths (n-gram handles ≤12)
+    PROBE_LENGTHS = [48, 36, 28, 20, 16]
+
+    def __init__(self, buckets=4_194_304, min_count=1, base_alpha=0.90):
         self.buckets = buckets
         self.min_count = min_count
-        self.alpha = alpha  # base mixing weight
-        self.length_bonus = length_bonus  # bonus per matched length
+        self.base_alpha = base_alpha
         self.mask = np.uint64(buckets - 1)
-        # Single pair of tables: ctx_table + full_table (same as n-gram cache)
-        # Key: rolling hash of the L-token context
         self.ctx_table = np.zeros(buckets, dtype=np.uint32)
         self.full_table = np.zeros(buckets, dtype=np.uint32)
         self.total_tokens = 0
 
     def _rolling_hash(self, val_np, positions, length):
-        """Compute rolling hash over (positions - length .. positions - 1) context."""
         n_primes = len(self.PRIMES)
         h = np.zeros(len(positions), dtype=np.uint64)
         for k in range(length):
@@ -345,40 +346,32 @@ class VariableLengthPhraseCache:
         return h
 
     def lookup(self, val_np, target_pos, targets):
-        """Find longest matching suffix and predict continuation.
-
-        Tries lengths max_len, max_len-1, ..., min_len. First match wins.
-
-        Returns:
-            (p_phrase, has_match, match_lengths): all shape (seg_len,)
-        """
+        """Find longest matching long phrase. Returns (p, has_match, match_len)."""
         seg_len = len(target_pos)
         best_p = np.zeros(seg_len, dtype=np.float64)
         has_match = np.zeros(seg_len, dtype=bool)
         match_lengths = np.zeros(seg_len, dtype=np.int32)
         tgt_u64 = targets.astype(np.uint64)
+        n_primes = len(self.PRIMES)
 
-        for L in range(self.max_len, self.min_len - 1, -1):
+        for L in self.PROBE_LENGTHS:
             eligible = (target_pos >= L) & ~has_match
             if not eligible.any():
                 continue
             idx = np.where(eligible)[0]
             pos = target_pos[idx]
             tgt = tgt_u64[idx]
-
             ctx_hash = self._rolling_hash(val_np, pos, L)
             ctx_key = (ctx_hash & self.mask).astype(np.intp)
             ctx_counts = self.ctx_table[ctx_key]
             sufficient = ctx_counts >= self.min_count
             if not sufficient.any():
                 continue
-
             s_idx = idx[sufficient]
             s_ctx = ctx_counts[sufficient].astype(np.float64)
-            full_hash = ctx_hash[sufficient] ^ (tgt[sufficient] * self.PRIMES[L % len(self.PRIMES)])
+            full_hash = ctx_hash[sufficient] ^ (tgt[sufficient] * self.PRIMES[L % n_primes])
             full_key = (full_hash & self.mask).astype(np.intp)
             s_full = self.full_table[full_key].astype(np.float64)
-
             has_target = s_full > 0
             if has_target.any():
                 pos_idx = s_idx[has_target]
@@ -392,18 +385,18 @@ class VariableLengthPhraseCache:
         return best_p, has_match, match_lengths
 
     def get_alpha(self, match_lengths, entropy):
-        """Alpha that increases with match length and model uncertainty."""
-        # Longer matches = higher confidence
-        len_factor = self.alpha + self.length_bonus * (match_lengths - self.min_len)
-        # Also modulate by entropy: uncertain model → trust phrase more
-        ent_factor = 1.0 / (1.0 + np.exp(-2.0 * (entropy - 3.0)))
-        alpha = len_factor * (0.3 + 0.7 * ent_factor)
+        """Long matches get very high alpha — they're almost certainly copies."""
+        # Length 16 → base_alpha, length 48 → 0.99
+        len_factor = self.base_alpha + (0.99 - self.base_alpha) * (match_lengths - 16) / 32
+        # Modulate by entropy: high entropy + long match → trust strongly
+        ent_factor = 1.0 / (1.0 + np.exp(-2.0 * (entropy - 2.5)))
+        alpha = len_factor * (0.5 + 0.5 * ent_factor)
         return np.clip(alpha, 0.0, 0.99)
 
     def update(self, val_np, start, end):
-        """Update tables with scored tokens (start..end inclusive)."""
+        """Update tables — only for probe lengths (5 hashes per token, not 21)."""
         n_primes = len(self.PRIMES)
-        for L in range(self.min_len, self.max_len + 1):
+        for L in self.PROBE_LENGTHS:
             first = max(start, L)
             if first > end:
                 continue
@@ -1599,17 +1592,14 @@ def eval_val_sliding_ttt(
 
     # Variable-length phrase cache (PPM/LZ-inspired)
     use_phrase = os.environ.get("USE_PHRASE_CACHE", "0") == "1"
-    phrase_cache = VariableLengthPhraseCache(
-        max_len=int(os.environ.get("PHRASE_MAX_LEN", "24")),
-        min_len=int(os.environ.get("PHRASE_MIN_LEN", "4")),
+    phrase_cache = LongPhraseAutomaton(
         buckets=int(os.environ.get("PHRASE_BUCKETS", "4194304")),
         min_count=int(os.environ.get("PHRASE_MIN_COUNT", "1")),
-        alpha=float(os.environ.get("PHRASE_ALPHA", "0.85")),
-        length_bonus=float(os.environ.get("PHRASE_LENGTH_BONUS", "0.02")),
+        base_alpha=float(os.environ.get("PHRASE_ALPHA", "0.90")),
     ) if use_phrase else None
     if use_phrase and rank == 0:
-        print(f"  Phrase cache: max_len={phrase_cache.max_len} min_len={phrase_cache.min_len} "
-              f"alpha={phrase_cache.alpha} length_bonus={phrase_cache.length_bonus}")
+        print(f"  Long phrase automaton: probes={LongPhraseAutomaton.PROBE_LENGTHS} "
+              f"alpha={phrase_cache.base_alpha}")
 
     # Regime tracker for document-type-adaptive alpha
     use_regime = os.environ.get("USE_REGIME_TRACKER", "0") == "1"
