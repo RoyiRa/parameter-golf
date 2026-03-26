@@ -325,8 +325,8 @@ class LongPhraseAutomaton:
                        4456441, 4587503, 4718579, 4849651, 4980719,
                        5111789, 5242877, 5373953, 5505023, 5636089], dtype=np.uint64)
 
-    # Sparse geometric probes: only check these lengths (n-gram handles ≤12)
-    PROBE_LENGTHS = [48, 36, 28, 20, 16]
+    # Sparse probes: only 3 lengths above n-gram order (keeps within eval budget)
+    PROBE_LENGTHS = [28, 20, 16]
 
     def __init__(self, buckets=4_194_304, min_count=1, base_alpha=0.90):
         self.buckets = buckets
